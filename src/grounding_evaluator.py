@@ -155,9 +155,9 @@ class GroundingEvaluator:
                 pbox = torch.cat([bboxes, padded_tensor], dim=0)
             # IoU
             ious, _ = _iou3d_par(
-                box_cxcyczwhd_to_xyzxyz(gt_bboxes),  # (obj, 6)
-                box_cxcyczwhd_to_xyzxyz(pbox).to(gt_bboxes.device)  # (obj*10, 6)
-            )  # (obj, obj*10)
+                box_cxcyczwhd_to_xyzxyz(gt_bboxes[:1]),  # (1, 6) target box only
+                box_cxcyczwhd_to_xyzxyz(pbox).to(gt_bboxes.device)  # (5, 6)
+            )  # (1, 5)
             ious = ious.reshape(1, 1, pbox.size(0))
             ious = ious[torch.arange(len(ious)), torch.arange(len(ious))]
 

@@ -3,16 +3,41 @@ import numpy as np
 import MinkowskiEngine as ME
 
 import torch,time
+import torch.nn.functional as F
 from mmcv.ops import nms3d, nms3d_normal
 from torch import nn
 
 from mmdet3d.structures.bbox_3d import rotation_3d_in_axis
-from .axis_aligned_iou_loss import AxisAlignedIoULoss2
+from .axis_aligned_iou_loss import (
+    AxisAlignedIoULoss2, axis_aligned_bbox_overlaps_3d, axis_aligned_diou_loss)
 from mmdet.models.losses import FocalLoss
 from .trans_modules import (BiEncoder, BiEncoderLayer, PositionEmbeddingLearned)
 
 import pdb
 import logging
+
+
+def soft_rank(scores, tau=0.1, eps=1e-6):
+    """
+    내림차순 soft rank. SR3D 보충자료 Eq.9-10.
+    scores: 1D tensor (점수가 클수록 '좋음', rank가 높음)
+    반환 r: 1D tensor, r in (0,1], 점수가 클수록 r이 1에 가까움.
+      R_i = (1/(N-1)) * sum_{j != i} sigmoid((s_j - s_i)/tau)   # 나보다 큰 점수의 비율
+      r_i = exp(-R_i)
+    tau -> 0 이면 hard rank에 수렴. 작은 점수일수록 R_i가 커져 r_i가 작아진다.
+    """
+    if scores.numel() == 0:
+        return scores
+    s = scores.view(-1)
+    N = s.numel()
+    if N == 1:
+        return torch.ones_like(s)
+    diff = s.unsqueeze(0) - s.unsqueeze(1)          # diff[i, j] = s_j - s_i
+    mask = ~torch.eye(N, dtype=torch.bool, device=s.device)
+    # i(행) 고정, j(열)에 대해 합산 -> R_i = sum_j sigmoid((s_j - s_i)/tau) / (N-1)
+    R = (torch.sigmoid(diff / tau) * mask).sum(dim=1) / (N - 1)
+    r = torch.exp(-R)
+    return r
 
 class MinkowskiFeatureFusionBlock(nn.Module):
     """
@@ -72,7 +97,10 @@ class TSPHead(nn.Module):
                  train_cfg=None,
                  test_cfg=dict(nms_pre=1, iou_thr=.5, score_thr=.01),
                  keep_loss_weight = 1.0,
-                 bbox_loss_weight = 1.0):
+                 bbox_loss_weight = 1.0,
+                 use_spota=False, use_ras=False,
+                 spota_k=6, spota_mu=1.0, spota_alpha=0.0,
+                 ras_beta=1.0, ras_tau=0.1):
         super(TSPHead, self).__init__()
         self.voxel_size = voxel_size
         self.pts_prune_threshold = pts_prune_threshold
@@ -82,6 +110,14 @@ class TSPHead(nn.Module):
         self.prune_threshold = prune_threshold
         self.keep_loss_weight = keep_loss_weight
         self.bbox_loss_weight = bbox_loss_weight
+        # SR3D SPOTA/RAS ablation 플래그 — 전부 기본 off. off일 때 기존 baseline과 동일 동작.
+        self.use_spota = use_spota
+        self.use_ras = use_ras
+        self.spota_k = spota_k
+        self.spota_mu = spota_mu
+        self.spota_alpha = spota_alpha
+        self.ras_beta = ras_beta
+        self.ras_tau = ras_tau
         self.assigner = TR3DAssigner(top_pts_threshold=32, label2level=[0])
         self.bbox_loss = AxisAlignedIoULoss2(mode='diou', reduction='none')
         self.cls_loss = FocalLoss(reduction='none')
@@ -200,13 +236,31 @@ class TSPHead(nn.Module):
     
 
     def _forward_single(self, x):
+        #Step 25-1: Bbox 오프셋·크기 회귀 — bbox_conv(MinkowskiConv1×1)로 각 voxel에서 6개 파라미터 예측
+        # out(N,128) → reg_final(N,6): [Δx, Δy, Δz, log_w, log_h, log_d]
+        # Δxyz: voxel 중심에서 박스 중심까지의 오프셋(m). log_whd: 박스 크기의 log scale 값.
         reg_final = self.bbox_conv(x).features
+
+        #Step 25-2: 박스 크기 활성화 — log scale 크기를 exp()로 변환해 반드시 양수(m)로 보장
+        # reg_final[:,3:6](N,3) log_whd → reg_distance(N,3) whd (양수, 단위: m)
+        # exp()를 쓰는 이유: 예측값이 음수가 되더라도 박스 크기는 항상 양수가 되도록 강제.
         reg_distance = torch.exp(reg_final[:, 3:6])
         reg_angle = reg_final[:, 6:]
+
+        #Step 25-3: Bbox 파라미터 조합 — 오프셋(3) + 크기(3)를 이어붙여 최종 bbox 파라미터 생성
+        # reg_final[:,:3](N,3) + reg_distance(N,3) → bbox_pred(N,6): [Δx,Δy,Δz, w,h,d]
+        # 실제 박스 중심 = voxel 좌표 + Δxyz. _bbox_pred_to_bbox()에서 최종 좌표로 변환.
         bbox_pred = torch.cat((reg_final[:, :3], reg_distance, reg_angle), dim=1)
+
+        #Step 25-4: Foreground 스코어 예측 — cls_conv(MinkowskiConv1×1)로 물체 존재 확률 예측
+        # out(N,128) → cls_pred(N,1): 각 voxel이 물체 중심 근방인지 여부의 이진 점수
+        # 학습 시 TR3DAssigner가 positive/negative를 결정 → FocalLoss로 지도.
         scores = self.cls_conv(x)
         cls_pred = scores.features
 
+        #Step 25-5: 배치 분리 + voxel 좌표 실수 변환 — 배치별 voxel 목록으로 분리 후 좌표를 m 단위로 환산
+        # bbox_pred(N,6), cls_pred(N,1), x.coordinates(N,4) → list[B](N_i,6), list[B](N_i,1), list[B](N_i,3)
+        # decomposition_permutations: SparseTensor 내 배치별 인덱스. coordinates[:,1:]×voxel_size로 정수 격자→미터 변환.
         bbox_preds, cls_preds, points = [], [], []
         for permutation in x.decomposition_permutations:
             bbox_preds.append(bbox_pred[permutation])
@@ -216,6 +270,9 @@ class TSPHead(nn.Module):
 
 
     def forward(self, x,text_feats, text_attention_mask, gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas,pc=None):
+        #Step 9: GT Bbox 레벨 분류 — 각 GT 박스를 볼륨 기준으로 레벨(0=small, 1=large)로 태깅
+        # gt_bboxes, gt_all_bbox_new, auxi_bbox → bboxes_state: list[B] Tensor(N_bbox, 8) [level, cx,cy,cz, w,h,d, ...]
+        # bboxes_state의 첫 번째 열이 레벨 인덱스. 이후 _get_keep_voxel에서 레벨별로 필터링하여 GT keep mask 생성.
         bboxes_level = []
         bboxes_state = []
         if self.assign_type == 'volume':
@@ -242,11 +299,18 @@ class TSPHead(nn.Module):
         keep_gts = []
         keep_preds, prune_masks = [], []
         prune_mask = None
-        inputs = x[1:]
-        x = inputs[-1]
+        inputs = x[1:]  # backbone 출력 list[4]에서 layer1 제외: inputs=[layer2, layer3, layer4]
+        x = inputs[-1]  # 가장 거친 레벨(layer4)에서 시작
+        # 루프 구조: i=2(레벨2, 가장 거침) → i=1(레벨1) → i=0(레벨0, 가장 섬세)
+        # if i==1: GT keep mask 계산 + upsample + 레벨1 특징 합산 + Step14 pruning
+        # elif i==0: GT keep mask 계산 + upsample + Step19 pruning + Completion branch(Step 20~22)
+        # if i>0(공통): 복셀 샘플링 + BiEncoder + keep_conv (Step 10~11 / Step 15~16)
         for i in range(len(inputs) - 1, -1, -1): # 2,1,0
-            if i ==1 :  #  1,0         
-                prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas) 
+            if i ==1 :  #  1,0
+                #Step 13: [레벨1] Keep Voxel GT 계산 + Upsample + 레벨1 특징 합산
+                # x(레벨2 SparseTensor) → prune_mask: (N_voxels_level2,) bool, keep_gt: list[B] bool
+                # _get_keep_voxel: 각 voxel이 GT bbox 영역 안에 있으면 True. 레벨2→1 upsample 후 레벨1 features 합산.
+                prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
 
                 keep_gt = []
                 for permutation in x.decomposition_permutations:
@@ -259,9 +323,16 @@ class TSPHead(nn.Module):
                                           coordinate_map_key=x.coordinate_map_key,
                                         coordinate_manager=x.coordinate_manager)
                 x = x + x_level
-                x = self._prune_training(x, prune_training_keep, i) 
+
+                #Step 14: [레벨1] 레벨2 Keep Score 기반 Pruning — keep_conv[1] 예측값으로 불필요 voxel 제거
+                # x(N_voxels_level1,128) → x(N_pruned_level1,128), prune_training_keep는 이전 i=2 순회에서 계산됨
+                # TopK 방식: pts_prune_threshold[1]=4000개 voxel만 유지. GT 박스 주변 voxel을 선별적으로 보존.
+                x = self._prune_training(x, prune_training_keep, i)
             elif i == 0:
-                prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas) 
+                #Step 18: [레벨0] Keep Voxel GT 계산 + Upsample + 레벨1 Keep Score 기반 Pruning
+                # x(레벨1 SparseTensor) → GT keep mask 계산 → 레벨1→0 upsample → random TopK pruning(1200~4000개)
+                # random_prune_threshold 범위에서 임의 수를 선택해 데이터 증강 효과. prune_training_keep는 i=1 순회에서 계산됨.
+                prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
                 keep_gt = []
                 for permutation in x.decomposition_permutations:
                     keep_gt.append(prune_mask[permutation])
@@ -270,16 +341,22 @@ class TSPHead(nn.Module):
                 prune_threshold_ = np.random.randint(self.random_prune_threshold[0], self.random_prune_threshold[1])
                 self.pts_prune_threshold = (prune_threshold_,self.pts_prune_threshold[1])
                 x = self._prune_training(x, prune_training_keep, i)
+
+                #Step 19: [레벨0] 레벨0(layer1) 특징 합산 → x_ori 생성
+                # x(N_pruned,128) + inputs[0] features → x_ori: SparseTensor(N_pruned,128)
+                # inputs[0](layer2 output)의 fine-grained 특징을 pruned voxel 위치에서 추출해 더함.
                 coords = x.coordinates.float()
                 x_level_features = inputs[i].features_at_coordinates(coords)  # select for partial addition
                 x_level = ME.SparseTensor(features=x_level_features,
                                           coordinate_map_key=x.coordinate_map_key,
                                         coordinate_manager=x.coordinate_manager)
                 x_ori = x + x_level
-                
-                
+
+                #Step 20: [Completion] 원본 layer1 포인트 샘플링 + com_trans BiEncoder — 누락 voxel 보완
+                # inputs[0](N_all_voxels,64) → sampled_features: (B,2400,128), sampled_coords: (B,2400,4)
+                # 2400개 미만이면 zero-padding. com_trans(BiEncoder×2): 텍스트와 교차 주의하여 물체 관련 voxel 활성화.
                 sampled_coords,sampled_features, original_indices = [],[],[]
-                
+
                 for permutation in inputs[0].decomposition_permutations:
                     original_indices.extend(permutation.cpu().numpy())
                     if len(permutation) > self.num_samples_com:
@@ -288,14 +365,14 @@ class TSPHead(nn.Module):
                         sampled_features.append(inputs[0].features[permutation][choice])
                         sampled_coords.append(inputs[0].coordinates[permutation][choice])
                     else:
-                        padding_size = self.num_samples_com - len(permutation)      
+                        padding_size = self.num_samples_com - len(permutation)
                         padded_features = torch.cat(
-                            [inputs[0].features[permutation], torch.zeros((padding_size, inputs[0].features[permutation].shape[1]), 
-                                                                  dtype=inputs[0].features.dtype).to(inputs[0].device)], dim=0) 
+                            [inputs[0].features[permutation], torch.zeros((padding_size, inputs[0].features[permutation].shape[1]),
+                                                                  dtype=inputs[0].features.dtype).to(inputs[0].device)], dim=0)
                         padded_coords = torch.cat(
                             [inputs[0].coordinates[permutation], -torch.ones((padding_size, inputs[0].coordinates[permutation].shape[1]),
-                                                                     dtype=inputs[0].coordinates.dtype).to(inputs[0].device)], 
-                                                                     dim=0)  
+                                                                     dtype=inputs[0].coordinates.dtype).to(inputs[0].device)],
+                                                                     dim=0)
                         sampled_features.append(padded_features)
                         sampled_coords.append(padded_coords)
                 sampled_features = torch.stack(sampled_features)
@@ -306,7 +383,11 @@ class TSPHead(nn.Module):
                     padding_mask=sampled_coords[:, :,0] == -1,
                     text_feats=text_feats,
                     text_padding_mask=text_attention_mask)
-                
+
+                #Step 21: [Completion] com_cls 예측 + 임계값 필터링 + x_ori 중복 제거
+                # sampled_features: (B,2400,128) → com_pred: (B,2400,1) → sigmoid > 0.15인 voxel만 보존
+                # com_pred_training: 손실 계산용 보존. sigmoid 임계값(=0.15)으로 물체 관련 voxel 선별.
+                # x_ori에 이미 있는 좌표는 제거(matches)하여 중복 추가를 방지.
                 com_pred = self.com_cls(sampled_features.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
                 valid_mask = sampled_coords[:, :,0] != -1
                 com_pred_training = [com_pred[k][valid_mask[k]] for k in range(len(com_pred))]
@@ -316,17 +397,23 @@ class TSPHead(nn.Module):
                 com_pred = com_pred[valid_mask].squeeze(-1)
                 com_mask = com_pred.sigmoid() > self.com_threshold
                 sampled_features = sampled_features[com_mask]
-                sampled_coords = sampled_coords[com_mask]                
+                sampled_coords = sampled_coords[com_mask]
                 matches = (sampled_coords.unsqueeze(1) == x_ori.coordinates.unsqueeze(0)).all(dim=-1).any(dim=1)
                 sampled_features = sampled_features[~matches]
-                sampled_coords = sampled_coords[~matches]                   
-                
-                x_com_features = x.features_at_coordinates(sampled_coords.float())     
-                x_com_features = x_com_features + sampled_features           
-                x = ME.SparseTensor(features=torch.cat((x_ori.features,x_com_features),dim=0), 
-                                    coordinates=torch.cat((x_ori.coordinates,sampled_coords),dim=0), 
+                sampled_coords = sampled_coords[~matches]
+
+                #Step 22: [Completion] Completion Voxel 병합 — x_ori와 com voxel을 합쳐 최종 레벨0 SparseTensor 생성
+                # x_ori(N_pruned,128) + com_voxels(N_com,128) → x: SparseTensor(N_pruned+N_com, 128)
+                # x_com_features: x_ori에서 com 좌표의 특징을 보간 후 com_features와 합산하여 풍부한 표현 생성.
+                x_com_features = x.features_at_coordinates(sampled_coords.float())
+                x_com_features = x_com_features + sampled_features
+                x = ME.SparseTensor(features=torch.cat((x_ori.features,x_com_features),dim=0),
+                                    coordinates=torch.cat((x_ori.coordinates,sampled_coords),dim=0),
                                     coordinate_manager=x_ori.coordinate_manager, tensor_stride=x_ori.tensor_stride, device=x_ori.device)
             if i > 0: # 2,1
+                #Step 10 (i=2, 레벨2) / Step 15 (i=1, 레벨1): Voxel 균일 샘플링 + BiEncoder (keep_trans[i-1])
+                # x(N_voxels,128) → sampled_features: (B, num_samples[i-1], 128), sampled_coords: (B, num_samples[i-1], 4)
+                # i=2: 3200개, i=1: 320개 샘플링. 부족하면 zero-padding(-1 좌표). keep_trans: 텍스트와 교차 주의하여 언어-유도 특징 갱신.
                 sampled_coords,sampled_features, original_indices = [],[],[]
                 prune_mask = torch.zeros(x.shape[0], dtype=torch.bool).to(x.device)
                 for permutation in x.decomposition_permutations:
@@ -338,14 +425,14 @@ class TSPHead(nn.Module):
                         sampled_coords.append(x.coordinates[permutation][choice])
                         prune_mask[permutation[choice]] = True
                     else:
-                        padding_size = self.num_samples[i-1] - len(permutation)      
+                        padding_size = self.num_samples[i-1] - len(permutation)
                         padded_features = torch.cat(
-                            [x.features[permutation], torch.zeros((padding_size, x.features[permutation].shape[1]), 
-                                                                  dtype=x.features.dtype).to(x.device)], dim=0) 
+                            [x.features[permutation], torch.zeros((padding_size, x.features[permutation].shape[1]),
+                                                                  dtype=x.features.dtype).to(x.device)], dim=0)
                         padded_coords = torch.cat(
                             [x.coordinates[permutation], -torch.ones((padding_size, x.coordinates[permutation].shape[1]),
-                                                                     dtype=x.coordinates.dtype).to(x.device)], 
-                                                                     dim=0)  
+                                                                     dtype=x.coordinates.dtype).to(x.device)],
+                                                                     dim=0)
                         sampled_features.append(padded_features)
                         sampled_coords.append(padded_coords)
                         prune_mask[permutation] = True
@@ -357,13 +444,17 @@ class TSPHead(nn.Module):
                     padding_mask=sampled_coords[:, :,0] == -1,
                     text_feats=text_feats,
                     text_padding_mask=text_attention_mask)
-                
+
                 valid_mask = sampled_coords[:, :,0] != -1
                 sampled_features = sampled_features[valid_mask]
                 sampled_coords = sampled_coords[valid_mask]
-                
-                x = ME.SparseTensor(features=sampled_features, coordinates=sampled_coords, 
+
+                x = ME.SparseTensor(features=sampled_features, coordinates=sampled_coords,
                                     coordinate_manager=x.coordinate_manager, tensor_stride=x.tensor_stride, device=x.device)
+
+                #Step 11 (i=2, 레벨2) / Step 16 (i=1, 레벨1): Keep Score 예측 — keep_conv[i-1]로 각 voxel의 보존 확률 예측
+                # x(N_sampled,128) → keep_scores: SparseTensor(N_sampled,1), prune_training_keep: SparseTensor(negative scores)
+                # keep_conv[i-1]: 1×1 MinkowskiConv. prune_training_keep(-keep_scores)는 다음 레벨 pruning에 사용됨.
                 keep_scores = self.keep_conv[i-1](x) # 1 MLP
                 prune_training_keep = ME.SparseTensor(
                                     -keep_scores.features,
@@ -382,10 +473,27 @@ class TSPHead(nn.Module):
                     pdb.set_trace()
                 keep_preds.append(keeps)
                 
+            #Step 12 (i=2) / Step 17 (i=1) / Step 23 (i=0): Lateral Block 처리 — 채널 정규화 및 특징 정제
+            # x(N,128) → x(N,128); Conv3×3→BN→ReLU
+            # 다음 레벨로 넘기기 전 특징을 안정화.
             x = self.__getattr__(f'lateral_block_{i}')(x)
             if i == 0:
+                #Step 23 (계속): Out Block 처리 — 최종 레벨0 특징을 출력 채널(128)로 변환
+                # x(N_level0,128) → out: SparseTensor(N_level0,128)
                 out = self.__getattr__(f'out_block_{i}')(x)
+
+        #Step 24: Text-Visual Fusion — out voxel 특징에 텍스트 [CLS] 토큰을 채널 방향으로 융합
+        # out(N_level0,128) + text_feats[:,0](B,128) → out: SparseTensor(N_level0,128)
+        # MinkowskiFeatureFusionBlock: batch 인덱스별로 [CLS] 토큰을 반복 확장 후 concat → Conv1×1→BN→ReLU.
         out = self.fuse(out, text_feats[:, 0])
+
+        #Step 25-1~25-5: 최종 Bbox/Cls 예측 — _forward_single(out)로 각 voxel에서 박스·스코어 예측 후 배치 분리
+        # out(N_level0,128) → bbox_pred: list[B](N_i,6), cls_pred: list[B](N_i,1), point: list[B](N_i,3)
+        # Step 25-1: bbox_conv → (N,6) [Δx,Δy,Δz, log_w,log_h,log_d]
+        # Step 25-2: exp(log_whd) → 양수 크기(m) 보장
+        # Step 25-3: offset + size concat → bbox_pred(N,6)
+        # Step 25-4: cls_conv → foreground score(N,1)
+        # Step 25-5: decomposition_permutations로 배치 분리 + coordinates×voxel_size로 m 단위 좌표 변환
         bbox_pred, cls_pred, point = self._forward_single(out)
         return [bbox_pred], [cls_pred], [point], keep_preds[::-1], keep_gts[::-1], bboxes_level, com_pred_training, com_coords_training
     
@@ -573,10 +681,24 @@ class TSPHead(nn.Module):
                      gt_labels,
                      img_meta,
                      com_pred,com_coords):
-        assigned_ids = self.assigner.assign(points, gt_bboxes, gt_labels, img_meta)
-        bbox_preds = torch.cat(bbox_preds)
+        bbox_preds_cat = torch.cat(bbox_preds)
+        points_cat = torch.cat(points)
+
+        # 메인 voxel 배정 — SPOTA on이면 예측 박스 기반 cost로, off면 기존 center-distance로.
+        if self.use_spota:
+            pred_boxes = self._bbox_pred_to_bbox(
+                points_cat, bbox_preds_cat).detach()
+            assigned_ids = self.assigner.assign(
+                points, gt_bboxes, gt_labels, img_meta,
+                bbox_preds=pred_boxes, use_spota=True,
+                k=self.spota_k, mu=self.spota_mu, alpha=self.spota_alpha,
+                cls_preds=torch.cat(cls_preds).detach())
+        else:
+            assigned_ids = self.assigner.assign(points, gt_bboxes, gt_labels, img_meta)
+
+        bbox_preds = bbox_preds_cat
         cls_preds = torch.cat(cls_preds)
-        points = torch.cat(points)
+        points = points_cat
 
         # cls loss
         n_classes = cls_preds.shape[1]
@@ -587,8 +709,14 @@ class TSPHead(nn.Module):
         else:
             cls_targets = gt_labels.new_full((len(pos_mask),), n_classes)
 
-        cls_loss = self.cls_loss(cls_preds, cls_targets)
-        
+        if self.use_ras:
+            cls_loss = self._ras_cls_loss(
+                cls_preds, cls_targets, pos_mask, bbox_preds, points,
+                assigned_ids, gt_bboxes)
+        else:
+            cls_loss = self.cls_loss(cls_preds, cls_targets)
+
+        # completion voxel 배정 — SPOTA/RAS 대상 아님(예측 박스가 없음), 기존 center-distance 그대로.
         assigned_ids_com = self.assigner.assign([com_coords], gt_bboxes, gt_labels, img_meta)
         # cls loss
         pos_mask_com = assigned_ids_com >= 0
@@ -618,11 +746,56 @@ class TSPHead(nn.Module):
         return bbox_loss, cls_loss, pos_mask, com_loss, pos_mask_com
 
 
-    def _loss(self, bbox_preds, cls_preds, points, gt_bboxes, gt_labels, img_metas, 
+    def _ras_cls_loss(self, cls_preds, cls_targets, pos_mask, bbox_preds,
+                      points, assigned_ids, gt_bboxes):
+        """RAS(Rank-aware Adaptive Self-Distillation) 분류 손실. SR3D Eq.6-7.
+        positive voxel만 FocalLoss<->RDL(self-distillation) 적응 혼합, negative는 FocalLoss 그대로.
+        """
+        fl = self.cls_loss(cls_preds, cls_targets)  # (N, n_classes), 기존과 동일한 FocalLoss
+        if pos_mask.sum() == 0:
+            return fl
+
+        pos_points = points[pos_mask]
+        pos_bbox_preds = bbox_preds[pos_mask]
+        pos_pred_boxes = self._bbox_pred_to_bbox(pos_points, pos_bbox_preds)
+
+        bbox_targets = torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1)
+        pos_gt_boxes = bbox_targets.to(points.device)[assigned_ids][pos_mask]
+        if pos_pred_boxes.shape[1] == 6:
+            pos_gt_boxes = pos_gt_boxes[:, :6]
+
+        # q_i = localization quality (IoU)
+        q = axis_aligned_bbox_overlaps_3d(
+            self._bbox_to_loss(pos_pred_boxes), self._bbox_to_loss(pos_gt_boxes),
+            mode='iou', is_aligned=True
+        ).clamp(min=1e-6, max=1 - 1e-6)
+
+        # sig_i = 분류 confidence
+        sig = cls_preds[pos_mask].sigmoid().squeeze(-1).clamp(min=1e-6, max=1 - 1e-6)
+
+        r_reg = soft_rank(q, tau=self.ras_tau)     # IoU 순위 (잘 맞출수록 1에 가까움)
+        r_cls = soft_rank(sig, tau=self.ras_tau)   # confidence 순위
+
+        # RDL: self-distillation 손실 (SR3D Eq.6), 부호는 cross-entropy 관례에 맞춰 -RDL을 손실로 사용.
+        rdl = (1 - r_reg).pow(self.ras_beta) * (q * torch.log(sig)) \
+            + q * (1 - q) * torch.log(1 - sig)
+        rdl_loss = -rdl
+
+        fl_pos = fl[pos_mask].squeeze(-1)
+        mixed_pos = (1 - r_cls) * fl_pos + r_cls * rdl_loss
+
+        cls_loss = fl.clone()
+        cls_loss[pos_mask] = mixed_pos.unsqueeze(-1)
+        return cls_loss
+
+
+    def _loss(self, bbox_preds, cls_preds, points, gt_bboxes, gt_labels, img_metas,
               keep_preds, keep_gts, bboxes_level, com_pred_training, com_coords_training):
         bbox_losses, cls_losses, pos_masks, com_losses, pos_masks_com = [], [], [], [], []
 
-        #keep loss
+        #Step 26: Keep Loss 계산 — 레벨2·1의 voxel 보존 예측(keep_pred)과 GT 마스크(keep_gt) 간 FocalLoss
+        # keep_preds: list[2] of list[B](N_i,1), keep_gts: list[2] of list[B](N_i,) bool → keep_losses: scalar
+        # 레벨당 loss를 /3으로 정규화 후 배치 평균. GT 박스 안에 있는 voxel=1, 밖=0으로 지도.
         keep_losses = 0
         for i in range(len(img_metas)):
             k_loss = 0
@@ -636,11 +809,15 @@ class TSPHead(nn.Module):
                     keep_loss = self.keep_loss(pred, gt, avg_factor=gt.sum())
                     k_loss = torch.mean(keep_loss) / 3 + k_loss
                 else:
-                    keep_loss = self.keep_loss(pred, gt, avg_factor=len(gt))  
+                    keep_loss = self.keep_loss(pred, gt, avg_factor=len(gt))
                     k_loss = torch.mean(keep_loss) / 3 + k_loss
 
             keep_losses = keep_losses + k_loss
 
+        #Step 27: Bbox / Cls / Com Loss 계산 — 샘플별 TR3DAssigner로 positive 할당 후 각 손실 집계
+        # gt_bboxes, bbox_preds, cls_preds, com_pred_training → bbox_losses, cls_losses, com_losses: list[B]
+        # bbox_loss: DiIoU(AxisAlignedIoULoss2). cls_loss: FocalLoss(물체 여부). com_loss: FocalLoss(completion).
+        # positive: assigner.assign으로 GT 박스와 가장 가까운 top_pts_threshold=32개 voxel 지정.
         for i in range(len(img_metas)):
             bbox_loss, cls_loss, pos_mask, com_loss,pos_mask_com = self._loss_single(
                 bbox_preds=[x[i] for x in bbox_preds],
@@ -658,6 +835,9 @@ class TSPHead(nn.Module):
             pos_masks.append(pos_mask)
             pos_masks_com.append(pos_mask_com)
 
+        #Step 28: 손실 집계 및 딕셔너리 반환 — 4개 손실을 배치 평균하여 반환
+        # bbox_losses, cls_losses, keep_losses, com_losses → dict{bbox_loss, cls_loss, keep_loss, com_loss}
+        # bdetr.py에서 총합 loss = bbox_loss + cls_loss + keep_loss + com_loss 계산. 각 손실에 weight 적용.
         return dict(
             bbox_loss=self.bbox_loss_weight * torch.mean(torch.cat(bbox_losses)),
             cls_loss=torch.sum(torch.cat(cls_losses)) / torch.sum(torch.cat(pos_masks)),
@@ -906,6 +1086,53 @@ class TSPHead(nn.Module):
         head_time = time.time() - start_time
         return results, head_time
 
+def _spota_cost(points, boxes, bbox_preds, mu, alpha, cls_preds=None):
+    """SPOTA(Spatial-Prioritized OTA) cost. SR3D 본문 Eq.3-5.
+    points: (n_points, n_boxes, 3) 브로드캐스트된 voxel 좌표 (사용 안 함, box와 pred만 필요)
+    boxes:  (n_points, n_boxes, 7) 브로드캐스트된 GT 박스 (마지막 열은 yaw/pad, axis-aligned에선 무시)
+    bbox_preds: (n_points, 6) voxel별 예측 박스 [cx,cy,cz,w,h,d]
+    반환: (n_points, n_boxes) cost 행렬. 작을수록 좋은(positive에 가까운) 후보.
+    """
+    if bbox_preds.shape[-1] != 6:
+        raise NotImplementedError(
+            'SPOTA assign only supports axis-aligned (6-dim) box predictions; '
+            'rotated (NR3D/SR3D, box_dim=7) path is not implemented.')
+
+    n_points, n_boxes = boxes.shape[0], boxes.shape[1]
+    gt_boxes6 = boxes[..., :6]                                        # (n_points, n_boxes, 6)
+    pred_boxes = bbox_preds.unsqueeze(1).expand(n_points, n_boxes, 6)
+
+    pred_lf = TSPHead._bbox_to_loss(pred_boxes)   # corner form (x1,y1,z1,x2,y2,z2)
+    gt_lf = TSPHead._bbox_to_loss(gt_boxes6)
+
+    # C_reg: DIoU loss (기존 bbox_loss와 동일한 정의 재사용)
+    c_reg = axis_aligned_diou_loss(
+        pred_lf.reshape(-1, 6), gt_lf.reshape(-1, 6), reduction='none'
+    ).reshape(n_points, n_boxes)
+
+    # R_VD: 정규화 vertex distance
+    vd = torch.norm(pred_lf[..., :3] - gt_lf[..., :3], dim=-1) \
+       + torch.norm(pred_lf[..., 3:] - gt_lf[..., 3:], dim=-1)
+    enclose_min = torch.minimum(pred_lf[..., :3], gt_lf[..., :3])
+    enclose_max = torch.maximum(pred_lf[..., 3:], gt_lf[..., 3:])
+    rho = torch.norm(enclose_max - enclose_min, dim=-1)
+    r_vd = vd / (2 * rho + 1e-6)
+
+    # gamma_c: center prior (예측 박스 중심 vs GT 중심)
+    center_dist_sq = torch.sum(
+        torch.pow(pred_boxes[..., :3] - gt_boxes6[..., :3], 2), dim=-1)
+    gamma_c = 1 - torch.exp(-mu * center_dist_sq)
+
+    cost = gamma_c * (c_reg + r_vd)
+
+    if alpha > 0 and cls_preds is not None:
+        # 선택 ablation(기본 off): overlapping distractor 대응용 grounding term.
+        grounding_term = alpha * (-F.logsigmoid(cls_preds).squeeze(-1))
+        cost = cost + grounding_term.unsqueeze(1)
+
+    return cost
+
+
 class TR3DAssigner:
     def __init__(self, top_pts_threshold, label2level):
         # top_pts_threshold: per box
@@ -917,8 +1144,12 @@ class TR3DAssigner:
         self.label2level = label2level
 
     @torch.no_grad()
-    def assign(self, points, gt_bboxes, gt_labels, img_meta):
+    def assign(self, points, gt_bboxes, gt_labels, img_meta,
+               bbox_preds=None, use_spota=False, k=6, mu=1.0, alpha=0.0,
+               cls_preds=None):
         # -> object id or -1 for each point
+        # bbox_preds/use_spota 등은 SPOTA(메인 voxel 배정) 전용. 기본값(use_spota=False)에서는
+        # 기존 center-distance 동작과 100% 동일 — completion 배정은 항상 이 기본 경로를 탄다.
         float_max = points[0].new_tensor(1e8)
         levels = torch.cat([points[i].new_tensor(i, dtype=torch.long).expand(len(points[i]))
                             for i in range(len(points))])
@@ -939,22 +1170,28 @@ class TR3DAssigner:
         point_levels = torch.unsqueeze(levels, 1).expand(n_points, n_boxes)
         level_condition = label_levels == point_levels
 
-        # condition 2: keep topk location per box by center distance
-        center = boxes[..., :3]
-        center_distances = torch.sum(torch.pow(center - points, 2), dim=-1)
-        center_distances = torch.where(level_condition, center_distances, float_max)
-        topk_distances = torch.topk(center_distances,
-                                    min(self.top_pts_threshold + 1, len(center_distances)),
-                                    largest=False, dim=0).values[-1]
-        topk_condition = center_distances < topk_distances.unsqueeze(0)
+        # primary: box를 고르는 기준값(작을수록 좋음). off=center-distance, SPOTA on=cost.
+        if use_spota and bbox_preds is not None:
+            primary_raw = _spota_cost(points, boxes, bbox_preds, mu, alpha, cls_preds)
+            top_k = k
+        else:
+            center = boxes[..., :3]
+            primary_raw = torch.sum(torch.pow(center - points, 2), dim=-1)
+            top_k = self.top_pts_threshold
 
-        # condition 3.0: only closest object to point
-        center_distances = torch.sum(torch.pow(center - points, 2), dim=-1)
-        _, min_inds_ = center_distances.min(dim=1)
+        # condition 2: keep topk location per box by primary (level 조건 적용)
+        primary = torch.where(level_condition, primary_raw, float_max)
+        topk_vals = torch.topk(primary,
+                               min(top_k + 1, len(primary)),
+                               largest=False, dim=0).values[-1]
+        topk_condition = primary < topk_vals.unsqueeze(0)
 
-        # condition 3: min center distance to box per point
-        center_distances = torch.where(topk_condition, center_distances, float_max)
-        min_values, min_ids = center_distances.min(dim=1)
+        # condition 3.0: only closest object to point (level 조건 무시, raw 기준 — 기존과 동일)
+        _, min_inds_ = primary_raw.min(dim=1)
+
+        # condition 3: min primary to box per point, among topk-selected
+        primary_topk = torch.where(topk_condition, primary_raw, float_max)
+        min_values, min_ids = primary_topk.min(dim=1)
         min_inds = torch.where(min_values < float_max, min_ids, -1)
         min_inds = torch.where(min_inds == min_inds_, min_ids, -1)
 

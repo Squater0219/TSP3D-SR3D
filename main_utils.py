@@ -106,6 +106,11 @@ def parse_option():
     parser.add_argument('--save_freq', type=int, default=10)  # epoch-wise
     parser.add_argument('--val_freq', type=int, default=5)  # epoch-wise
 
+    # wandb
+    parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
+    parser.add_argument('--wandb_project', default='TSP3D', type=str)
+    parser.add_argument('--wandb_run_name', default=None, type=str)
+
     # others
     parser.add_argument("--local_rank", type=int,
                         help='local rank for DistributedDataParallel')  # note
@@ -119,9 +124,23 @@ def parse_option():
     parser.add_argument('--pp_checkpoint', default=None)    # pointnet checkpoint
     parser.add_argument('--reduce_lr', action='store_true')
 
+    # SR3D SPOTA/RAS ablation (TSP3D_SR3D_이식_지시서.md) — 전부 기본 off.
+    parser.add_argument('--use_spota', action='store_true',
+                        help='SPOTA(spatial-priority cost 기반 top-k) assignment 사용')
+    parser.add_argument('--use_ras', action='store_true',
+                        help='RAS(rank-aware self-distillation) 분류 손실 사용')
+    parser.add_argument('--spota_k', type=int, default=6)
+    parser.add_argument('--spota_mu', type=float, default=1.0)
+    parser.add_argument('--spota_alpha', type=float, default=0.0)
+    parser.add_argument('--ras_beta', type=float, default=1.0)
+    parser.add_argument('--ras_tau', type=float, default=0.1)
+
     args, _ = parser.parse_known_args()
 
     args.eval = args.eval or args.eval_train
+
+    if args.local_rank is None:
+        args.local_rank = int(os.environ.get('LOCAL_RANK', 0))
 
     return args
 
@@ -194,6 +213,29 @@ class BaseTrainTester:
         # tensorboard
         self.tensorboard = record_tensorboard.TensorBoard(args.log_dir, distributed_rank=dist.get_rank())
 
+        # Best val metrics (updated by evaluate_one_epoch)
+        self.best_val = {'acc25': 0., 'acc50': 0.}
+
+        # wandb
+        self.wandb_run = None
+        if dist.get_rank() == 0 and getattr(args, 'wandb', False):
+            try:
+                import wandb
+                run_name = args.wandb_run_name or (
+                    ','.join(args.dataset) + '_' + args.log_dir.split('/')[-1]
+                )
+                self.wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    name=run_name,
+                    config=vars(args),
+                    dir=args.log_dir,
+                )
+                print(f"[wandb] run initialized: {self.wandb_run.url}  (id={self.wandb_run.id})")
+                self.logger.info(f"wandb run initialized: {self.wandb_run.url}  (id={self.wandb_run.id})")
+            except Exception as e:
+                print(f"[wandb] init failed: {e}")
+                self.logger.warning(f"wandb init failed: {e}")
+
         # Save config file and initialize tb writer
         if dist.get_rank() == 0:
             path = os.path.join(args.log_dir, "config.json")
@@ -223,7 +265,7 @@ class BaseTrainTester:
         train_dataset, test_dataset = self.get_datasets(args)
         # Samplers and loaders
         g = torch.Generator()
-        g.manual_seed(0)
+        g.manual_seed(args.rng_seed)
 
         if args.eval:
             train_loader = None
@@ -373,6 +415,7 @@ class BaseTrainTester:
         # ##############################
         # NOTE Training and Validation #
         # ##############################
+
         for epoch in range(args.start_epoch, args.max_epoch + 1):
             train_loader.sampler.set_epoch(epoch)
             tic = time.time()
@@ -384,6 +427,7 @@ class BaseTrainTester:
                 optimizer, scheduler, args
             )
             
+            epoch_time = time.time() - tic
             # log
             self.logger.info(
                 'epoch {}, total time {:.2f}, '
@@ -391,13 +435,24 @@ class BaseTrainTester:
                 'lr_tran {:.5f}, '
                 'lr_text {:.5f}, '
                 'lr_select {:.5f}, '.format(
-                    epoch, (time.time() - tic),
+                    epoch, epoch_time,
                     optimizer.param_groups[0]['lr'],
                     optimizer.param_groups[1]['lr'],
                     optimizer.param_groups[2]['lr'],
                     optimizer.param_groups[3]['lr']
                 )
             )
+
+            # wandb: epoch-level summary
+            if dist.get_rank() == 0 and self.wandb_run is not None:
+                self.wandb_run.log({
+                    'epoch': epoch,
+                    'epoch_time_s': epoch_time,
+                    'lr/base':   optimizer.param_groups[0]['lr'],
+                    'lr/trans':  optimizer.param_groups[1]['lr'],
+                    'lr/text':   optimizer.param_groups[2]['lr'],
+                    'lr/select': optimizer.param_groups[3]['lr'],
+                }, step=epoch * len(train_loader))
 
             # save model and validate
             if epoch % args.val_freq == 0:
@@ -419,6 +474,8 @@ class BaseTrainTester:
             args.max_epoch, test_loader,
             model, criterion, set_criterion, args
         )
+        if dist.get_rank() == 0 and self.wandb_run is not None:
+            self.wandb_run.finish()
         return saved_path
 
     @staticmethod
@@ -505,25 +562,54 @@ class BaseTrainTester:
         # Loop over batches
         train_loader = tqdm(train_loader)
         for batch_idx, batch_data in enumerate(train_loader):
+            #Step 1: GT 파싱 — 배치 데이터에서 GT bbox·레이블·보조박스를 DepthInstance3DBoxes로 변환
+            # batch_data dict → gt_bboxes_3d: list[B] DepthInstance3DBoxes(N_gt,6), gt_labels_3d: list[B](N_gt,)
+            # box_label_mask로 패딩 제거, 레이블은 class-agnostic(=0)으로 초기화, auxi_bbox는 sr3d anchor 박스.
             gt_bboxes_3d, gt_labels_3d, gt_all_bbox_new, auxi_bbox, img_metas = get_gt(batch_data)
-            # Move to GPU
+
+            #Step 2: GPU 전송 — 배치 내 모든 Tensor를 non_blocking=True로 GPU에 업로드
+            # batch_data(CPU Tensor) → batch_data(GPU Tensor)
+            # DataLoader의 pin_memory=True와 함께 CPU→GPU 복사 오버헤드를 최소화.
             batch_data = self._to_gpu(batch_data)
-            # get the input data: pointcloud and text
+
+            #Step 3: 입력 딕셔너리 구성 — 모델에 전달할 포인트 클라우드·텍스트·타겟 카테고리 추출
+            # batch_data → inputs: {point_clouds: (B,N,6) float32, text: list[B] str, target_cat: (B,) int}
+            # point_clouds = xyz(3채널) + RGB(3채널). target_cat = 타겟 객체의 ScanNet 카테고리 인덱스.
             inputs = self._get_inputs(batch_data)
-            
+
+            #Step 4~25: 모델 Forward pass — Voxelization→백본→텍스트 인코딩→TSPHead(프루닝·예측·손실)
+            # inputs + GT → losses: {bbox_loss, cls_loss, keep_loss, com_loss, loss(4개 합산)}
+            # bdetr.py Step 4~8, multilevel_head.py Step 9~25 순서로 실행됨.
             losses = model(inputs, gt_bboxes_3d, gt_labels_3d, gt_all_bbox_new, auxi_bbox, img_metas, epoch)
             loss = losses['loss']
 
+            #Step 26: Gradient 초기화 — 직전 배치의 누적 그라디언트를 0으로 리셋
+            # 누적된 .grad → zero
+            # backward() 전 필수 호출. 생략 시 배치 간 그라디언트가 합산되어 잘못된 업데이트 발생.
             optimizer.zero_grad()
+
+            #Step 27: 역전파 — 스칼라 손실에서 모든 학습 파라미터의 그라디언트 계산
+            # loss(scalar) → 각 파라미터의 .grad 채워짐
+            # AdamW 4개 그룹(base/trans/text/select) 전체에 chain rule 적용.
             loss.backward()
 
             if args.clip_norm > 0:
+                #Step 28: Gradient 클리핑 — 전체 파라미터 그라디언트 L2 norm을 clip_norm(=0.1)으로 제한
+                # grad_norm(클리핑 전) → grad_norm(≤0.1)
+                # 학습 초기 exploding gradient를 방지하여 안정적 수렴 보장.
                 grad_total_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), args.clip_norm
                 )
                 stat_dict['grad_norm'] = grad_total_norm
-            
+
+            #Step 29: 파라미터 업데이트 — AdamW로 1차·2차 모멘트를 이용해 파라미터 갱신
+            # θ_t → θ_{t+1} (Adam 모멘트 추정 + decoupled weight decay)
+            # 그룹별 lr 차등 적용: base=5e-4, trans=5e-4, text=1e-5, select=4e-4.
             optimizer.step()
+
+            #Step 30: LR 스케줄러 업데이트 — 배치 단위로 warmup 또는 step decay 적용
+            # lr_t → lr_{t+1}
+            # lr_decay_epochs 이전: 선형 warmup. 이후: epoch 경계에서 ×lr_decay_rate(=0.1) 감소.
             scheduler.step()
 
             # Accumulate statistics and print out
@@ -531,15 +617,30 @@ class BaseTrainTester:
 
             # print loss
             if (batch_idx + 1) % args.print_freq == 0:
+                n = batch_idx + 1
                 # Terminal logs
                 self.logger.info(
                     f'Train: [{epoch}][{batch_idx + 1}/{len(train_loader)}]  '  # Train: [30][2000/2432]
                 )
                 self.logger.info(''.join([
-                    f'{key} {stat_dict[key] / (batch_idx + 1):.4f} \t'
+                    f'{key} {stat_dict[key] / n:.4f} \t'
                     for key in sorted(stat_dict.keys())
                     if 'loss' in key
                 ])) # loss，loss_bbox，loss_ce，loss_sem_align，loss_giou，query_points_generation_loss
+
+                # wandb: per-step log
+                if dist.get_rank() == 0 and self.wandb_run is not None:
+                    wlog = {f'train/{k}': stat_dict[k] / n
+                            for k in sorted(stat_dict.keys()) if 'loss' in k}
+                    if 'grad_norm' in stat_dict:
+                        gn = stat_dict['grad_norm']
+                        wlog['train/grad_norm'] = gn.item() if hasattr(gn, 'item') else float(gn)
+                    wlog['lr/base']   = optimizer.param_groups[0]['lr']
+                    wlog['lr/trans']  = optimizer.param_groups[1]['lr']
+                    wlog['lr/text']   = optimizer.param_groups[2]['lr']
+                    wlog['lr/select'] = optimizer.param_groups[3]['lr']
+                    global_step = (epoch - 1) * len(train_loader) + n
+                    self.wandb_run.log(wlog, step=global_step)
 
 
     # BRIEF eval 

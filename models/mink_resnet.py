@@ -104,21 +104,27 @@ class TSPBackbone(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        """Forward pass of ResNet.
-
-        Args:
-            x (ME.SparseTensor): Input sparse tensor.
-
-        Returns:
-            list[ME.SparseTensor]: Output sparse tensors.
-        """
+        #Step 5-1: Stem — conv1(k=3,s=2) + BN + ReLU로 초기 특징 추출
+        # SparseTensor(N_voxels, 6) → SparseTensor(N_voxels, 64), tensor_stride=2, 격자=0.02m
+        # 6채널(xyz+RGB)을 64채널로 확장. stride=2로 voxel 수 감소.
         x = self.conv1(x)
         x = self.norm1(x)
         x = self.relu(x)
+
         if self.pool:
+            #Step 5-2: MaxPool(k=2,s=2) — 공간 해상도를 절반으로 줄여 수용장 확대
+            # SparseTensor(N_voxels, 64) → SparseTensor(N_voxels↓, 64), tensor_stride=4, 격자=0.04m
+            # Sparse MaxPooling: 각 2×2×2 블록 내 최댓값만 보존. Stem 후 누적 stride=4.
             x = self.maxpool(x)
+
         outs = []
         for i in range(self.num_stages):
+            #Step 5-3~5-6: ResNet Stage {i+1} — BasicBlock×n으로 깊이별 다중 스케일 특징 추출
+            # 각 스테이지 시작의 stride=2 다운샘플 → 이후 블록은 stride=1 유지
+            # i=0: BasicBlock×3, ch=64,  tensor_stride=8,  격자=0.08m → outs[0] (TSPHead 미사용)
+            # i=1: BasicBlock×4, ch=128, tensor_stride=16, 격자=0.16m → outs[1] (inputs[0], Completion 소스)
+            # i=2: BasicBlock×6, ch=128, tensor_stride=32, 격자=0.32m → outs[2] (inputs[1], 레벨1)
+            # i=3: BasicBlock×3, ch=128, tensor_stride=64, 격자=0.64m → outs[3] (inputs[2], 레벨2 시작)
             x = getattr(self, f'layer{i + 1}')(x)
             outs.append(x)
         return outs

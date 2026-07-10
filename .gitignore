@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+
+pretrained_models/
+tensorboard_output/
+
+pointnet2/build/
+pointnet2/dist/
+pointnet2/*.egg-info/
+
+wandb/
+*.log

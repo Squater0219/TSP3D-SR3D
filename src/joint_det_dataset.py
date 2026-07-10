@@ -191,6 +191,7 @@ class Joint3DDataset(Dataset):
                     'target': line[headers['instance_type']],
                     'anchors': eval(line[headers['anchors_types']]),
                     'anchor_ids': eval(line[headers['anchor_ids']]),
+                    'target_cat': self.label_map.get(line[headers['instance_type']], 17),
                     'dataset': dset
                 }
                 for line in csv_reader
@@ -223,6 +224,7 @@ class Joint3DDataset(Dataset):
                     'utterance': line[headers['utterance']],
                     'anchor_ids': [],
                     'anchors': [],
+                    'target_cat': self.label_map.get(line[headers['instance_type']], 17),
                     'dataset': 'nr3d'
                 }
                 for line in csv_reader

@@ -110,7 +110,10 @@ class TrainTester(BaseTrainTester):
             pointnet_ckpt=args.pp_checkpoint,
             data_path = args.data_root,
             self_attend=args.self_attend,
-            voxel_size = args.voxel_size
+            voxel_size = args.voxel_size,
+            use_spota=args.use_spota, use_ras=args.use_ras,
+            spota_k=args.spota_k, spota_mu=args.spota_mu, spota_alpha=args.spota_alpha,
+            ras_beta=args.ras_beta, ras_tau=args.ras_tau
         )
         return model
 
@@ -185,7 +188,36 @@ class TrainTester(BaseTrainTester):
                 for t in evaluator.thresholds:
                     self.logger.info(''.join([
                         f"{'3dcnn'} Acc{t:.2f}: ", f"Top-{1}: {evaluator.dets[('3dcnn', t, 1, 'bbf')] / max(evaluator.gts[('3dcnn', t, 1, 'bbf')], 1):.5f}"
-                    ]))           
+                    ]))
+
+                # wandb: val log
+                if self.wandb_run is not None:
+                    prefix, topk, mode = '3dcnn', 1, 'bbf'
+                    wlog = {}
+                    for t in evaluator.thresholds:
+                        acc = (evaluator.dets[(prefix, t, topk, mode)]
+                               / max(evaluator.gts[(prefix, t, topk, mode)], 1))
+                        wlog[f'val/Acc{t:.2f}'] = acc
+                        key = f'acc{int(t * 100)}'
+                        if acc > self.best_val.get(key, 0.):
+                            self.best_val[key] = acc
+                        wlog[f'val/best_Acc{t:.2f}'] = self.best_val[key]
+                    for field, label in [
+                        ('easy', 'easy'), ('hard', 'hard'),
+                        ('vd',   'view_dep'), ('vid', 'view_indep'),
+                        ('unique', 'unique'), ('multi', 'multi'),
+                    ]:
+                        wlog[f'val/iou25_{label}'] = (
+                            evaluator.dets[field] / evaluator.gts[field])
+                    for field, label in [
+                        ('easy50', 'easy'), ('hard50', 'hard'),
+                        ('vd50',   'view_dep'), ('vid50', 'view_indep'),
+                        ('unique50', 'unique'), ('multi50', 'multi'),
+                    ]:
+                        wlog[f'val/iou50_{label}'] = (
+                            evaluator.dets[field] / evaluator.gts[field])
+                    wlog['epoch'] = epoch
+                    self.wandb_run.log(wlog)           
 
         print('inf: ', np.array(inf_speeds).mean(),'vis_back_speeds: ', np.array(vis_back_speeds).mean(),
               'text_back_speeds: ', np.array(text_back_speeds).mean(),'fuiosn_speeds: ', np.array(fuiosn_speeds).mean(),
@@ -333,10 +365,22 @@ if __name__ == '__main__':
     # https://github.com/open-mmlab/mmcv/issues/1969#issuecomment-1304721237
     torch.distributed.init_process_group(backend='nccl', init_method='env://', timeout=datetime.timedelta(seconds=5400))  
     
-    # cudnn
+    # cudnn — benchmark=False required for bit-exact reproducibility
     torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+    # TF32 matmul (Ampere+/Hopper tensor cores) — cudnn.allow_tf32 is on by
+    # default already; matmul defaults to off as of torch>=1.12 and must be
+    # enabled explicitly.
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    # Global seed: same seed → same model init → bit-for-bit identical training
+    seed = opt.rng_seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
     train_tester = TrainTester(opt)
     ckpt_path = train_tester.main(opt)
