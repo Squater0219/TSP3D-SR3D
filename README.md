@@ -1,193 +1,82 @@
-# TSP3D: Text-guided Sparse Voxel Pruning for Efficient 3D Visual Grounding
+# TSP3D + SR3D (SPOTA / RAS) — 이 fork에 대해
 
-This repo contains the official PyTorch implementation for paper [Text-guided Sparse Voxel Pruning for Efficient 3D Visual Grounding](https://arxiv.org/abs/2502.10392). Look here for [中文解读](https://zhuanlan.zhihu.com/p/29557016028).
+이 저장소는 [TSP3D](https://github.com/GWxuan/TSP3D)(CVPR 2025 Highlight)를 기반으로,
+[SR3D](https://arxiv.org/abs/2502.10392)(AAAI 2026, 실내 3D detection)에서 제안한 학습 절차 두 가지 —
+**SPOTA**(label assignment)와 **RAS**(분류 손실) — 를 3D visual grounding(TSP3D)에 이식한 fork입니다.
 
-> Text-guided Sparse Voxel Pruning for Efficient 3D Visual Grounding  
-> [Wenxuan Guo](https://gwxuan.github.io/)\*, [Xiuwei Xu](https://xuxw98.github.io/)\*, [Ziwei Wang](https://ziweiwangthu.github.io/), [Jianjiang Feng](https://ivg.au.tsinghua.edu.cn/~jfeng/index.html)$^\dagger$, [Jie Zhou](https://scholar.google.com/citations?user=6a79aPwAAAAJ&hl=en&authuser=1), [Jiwen Lu](http://ivg.au.tsinghua.edu.cn/Jiwen_Lu/)$^\dagger$
+원본 TSP3D의 README는 [README_TSP.md](README_TSP.md)에 그대로 유지되어 있습니다(설치/데이터 준비/원본 학습·평가 방법은 그쪽 참고).
+이 문서는 **이 fork에서 추가된 부분만** 다룹니다.
 
-\* Equal contribution $\dagger$ Corresponding author
+## 무엇을, 왜
 
-In this work, we propose an efficient multi-level convolution architecture for <b>3D visual grounding</b>. TSP3D achieves superior performance compared to previous approaches in both <b>inference speed and accuracy</b>.
+TSP3D는 sparse-conv 기반 single-stage 3D visual grounding 모델로, 추론 구조와 속도는 그대로 두고 싶습니다.
+SR3D의 핵심 진단은 "학습과 평가(ranking 기반 AP)가 어긋나 있다"는 것이고, 이를 두 가지로 해결합니다.
 
-## News
-- [2025/2/27]: TSP3D is accepted to CVPR2025 as Hightlight paper (All Strong Accept)!!
-- [2025/2/16]: Code and arxiv paper released.
+- **SPOTA** (Spatial-Prioritized OTA): 현재 TSP3D의 label assignment는 voxel-GT 박스 **중심거리** 기반 top-k 휴리스틱입니다.
+  이를 예측 박스의 기하적 신뢰도(vertex distance + DIoU + center prior)로 동적으로 top-k를 고르는 방식으로 교체합니다.
+- **RAS** (Rank-aware Adaptive Self-Distillation): 분류 confidence가 localization 정확도(IoU) 순위와 정렬되도록,
+  기존 FocalLoss를 IoU 기반 self-distillation 손실과 적응적으로 혼합합니다.
 
-## Method
-Method Pipeline:
-<figure>
-<p align="center" >
-<img src='figs/method1.png' width=900 alt="Figure 1"/>
-</p>
-</figure>
+3DVG는 query당 target이 1개라 본질적으로 ranking 문제이고, SR3D의 동기가 detection보다 더 직접적으로 들어맞습니다.
 
-## Getting Started
-### 1. Installation
+이식 작업의 상세 스펙/코드 위치/수식은 [TSP3D_SR3D_이식_지시서.md](TSP3D_SR3D_이식_지시서.md)에 있습니다.
 
-+ **(1)** Install environment with `environment.yml` file:
-  ```
-  conda env create -f environment.yml --name TSP3D
-  ```
-  + or you can install manually:
-    ```
-    conda create -n TSP3D python=3.9
-    conda activate TSP3D
-    conda install pytorch==1.9.0 torchvision==0.10.0 cudatoolkit=11.1 -c pytorch -c nvidia
-    pip install numpy ipython psutil traitlets transformers termcolor ipdb scipy tensorboardX h5py wandb plyfile tabulate
-    ```
-+ **(2)** Install spacy for text parsing
-  ```
-  pip install spacy
-  # 3.3.0
-  pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.3.0/en_core_web_sm-3.3.0.tar.gz
-  ```
+## 절대 원칙
 
-+ **(3)** Follow [mmdetection3d](https://github.com/open-mmlab/mmdetection3d/blob/main/docs/en/get_started.md) to install mmcv, mmdet and mmdet3d.
+- **모든 신규 기능은 플래그로 on/off**, 기본값은 전부 **off**.
+- 플래그가 전부 off이면 **기존 baseline과 동일하게** 동작합니다 (`TR3DAssigner.assign()`은 off일 때 리팩터링 전과
+  bit-identical하도록 구현·검증했습니다).
+- 추론 경로(`forward_test`, `_get_bboxes*`)와 기존 pruning(TGP)/completion(CBA)/text fusion/backbone은 건드리지 않았습니다.
+  SPOTA/RAS는 **학습에만** 개입하는 training-only 기법입니다.
 
-+ **(4)** Install MinkowskiEngine.
-  ```shell
-  conda install openblas-devel -c anaconda
-  pip install -U git+https://github.com/NVIDIA/MinkowskiEngine -v --no-deps --install-option="--blas_include_dirs=/opt/conda/include" --install-option="--blas=openblas"
-  ```
+## 추가된 CLI 플래그
 
-### 2. Data preparation
+| 플래그 | 기본값 | 설명 |
+|---|---|---|
+| `--use_spota` | off | SPOTA(cost 기반 top-k) assignment 사용 |
+| `--use_ras` | off | RAS(rank-aware self-distillation) 분류 손실 사용 |
+| `--spota_k` | 6 | SPOTA top-k 개수 |
+| `--spota_mu` | 1.0 | SPOTA center-prior 가중치(μ) |
+| `--spota_alpha` | 0.0 | SPOTA 선택적 grounding term 가중치(기본 off) |
+| `--ras_beta` | 1.0 | RAS self-distillation 항의 rank 지수(β) |
+| `--ras_tau` | 0.1 | soft-rank 온도(τ), 작을수록 hard rank에 근접 |
 
-The final required files are as follows:
-```
-├── [DATA_ROOT]
-│	├── [1] train_v3scans.pkl # Packaged ScanNet training set
-│	├── [2] val_v3scans.pkl   # Packaged ScanNet validation set
-│	├── [3] ScanRefer/        # ScanRefer utterance data
-│	│	│	├── ScanRefer_filtered_train.json
-│	│	│	├── ScanRefer_filtered_val.json
-│	│	│	└── ...
-│	├── [4] ReferIt3D/        # NR3D/SR3D utterance data
-│	│	│	├── nr3d.csv
-│	│	│	├── sr3d.csv
-│	│	│	└── ...
-│	├── [5] roberta-base/     # roberta pretrained language model
-│	├── [6] checkpoints/      # We will release the trained models
+## 사용 예시
+
+```bash
+# baseline (기존과 동일)
+sh scripts/train_scanrefer_single.sh
+
+# RAS만
+python train_dist_mod.py ... --use_ras --ras_beta 1.0 --ras_tau 0.1
+
+# SPOTA만
+python train_dist_mod.py ... --use_spota --spota_k 6 --spota_mu 1.0
+
+# full (SPOTA + RAS)
+python train_dist_mod.py ... --use_spota --use_ras
 ```
 
-+ **[1] [2] Prepare ScanNet Point Clouds Data**
-  + **1)** Download ScanNet v2 data. Follow the [ScanNet instructions](https://github.com/ScanNet/ScanNet) to apply for dataset permission, and you will get the official download script `download-scannet.py`. Then use the following command to download the necessary files:
-    ```
-    python2 download-scannet.py -o [SCANNET_PATH] --type _vh_clean_2.ply
-    python2 download-scannet.py -o [SCANNET_PATH] --type _vh_clean_2.labels.ply
-    python2 download-scannet.py -o [SCANNET_PATH] --type .aggregation.json
-    python2 download-scannet.py -o [SCANNET_PATH] --type _vh_clean_2.0.010000.segs.json
-    python2 download-scannet.py -o [SCANNET_PATH] --type .txt
-    ```
-    where `[SCANNET_PATH]` is the output folder. The scannet dataset structure should look like below:
-    ```
-    ├── [SCANNET_PATH]
-    │   ├── scans
-    │   │   ├── scene0000_00
-    │   │   │   ├── scene0000_00.txt
-    │   │   │   ├── scene0000_00.aggregation.json
-    │   │   │   ├── scene0000_00_vh_clean_2.ply
-    │   │   │   ├── scene0000_00_vh_clean_2.labels.ply
-    │   │   │   ├── scene0000_00_vh_clean_2.0.010000.segs.json
-    │   │   ├── scene.......
-    ```
-  + **2)** Package the above files into two .pkl files(`train_v3scans.pkl` and `val_v3scans.pkl`):
-    ```
-    python Pack_scan_files.py --scannet_data [SCANNET_PATH] --data_root [DATA_ROOT]
-    ```
-+ **[3] ScanRefer**: Download ScanRefer annotations following the instructions [HERE](https://github.com/daveredrum/ScanRefer). Unzip inside `[DATA_ROOT]`.
-+ **[4] ReferIt3D**: Download ReferIt3D annotations following the instructions [HERE](https://github.com/referit3d/referit3d). Unzip inside `[DATA_ROOT]`.
-+ **[5] roberta-base**: Download the roberta pytorch model:
-  ```
-  cd [DATA_ROOT]
-  git clone https://huggingface.co/roberta-base
-  cd roberta-base
-  rm -rf pytorch_model.bin
-  wget https://huggingface.co/roberta-base/resolve/main/pytorch_model.bin
-  ```
+## 어디를 고쳤는지
 
+- `models/multilevel_head.py`
+  - `soft_rank()`: 미분 가능한 내림차순 soft-rank 유틸 (SR3D 보충자료 Eq.9-10)
+  - `TSPHead._ras_cls_loss()`: RAS 분류 손실 (Eq.6-7). positive voxel만 대상, completion(`com_loss`)은 미변경.
+  - `_spota_cost()` + `TR3DAssigner.assign()`: SPOTA cost 계산 (Eq.3-5) 및 `bbox_preds/use_spota/k/mu/alpha` 인자 추가
+    (기본값 하위호환). completion 배정은 항상 기존 center-distance 경로.
+- `models/bdetr.py`, `train_dist_mod.py`, `main_utils.py`: 플래그를 argparse → `BeaUTyDETR` → `TSPHead`까지 배선.
 
-### 3. Training
+## 검증 상태
 
-+ Please specify the paths of `--data_root`, `--log_dir` in the `train_*.sh` script first.
-+ For **ScanRefer** training
-  ```
-  sh scripts/train_scanrefer_single.sh
-  ```
-+ For **SR3D** training
-  ```
-  sh scripts/train_sr3d.sh
-  ```
-+ For **NR3D** training
-  ```
-  sh scripts/train_nr3d.sh
-  ```
+구현 단계에서 확인한 것 (synthetic 텐서 기반 no-crash/단위 테스트):
+- [x] `soft_rank` 단조성 단위 테스트, `N=1`/`N=0` 엣지케이스
+- [x] `TSPHead` 생성자 off/on 정상
+- [x] `assign()` 기본 호출 vs `use_spota=False` 명시 호출이 완전히 동일 (`torch.equal`)
+- [x] SPOTA cost 경로(`alpha=0`/`alpha>0`) 크래시 없이 동작, rotated(7-dim) 입력엔 `NotImplementedError`
+- [x] RAS 손실 forward/backward 정상, NaN/Inf 없음, positive 0개 엣지케이스 처리
 
-### 4. Evaluation
-
-+ Please specify the paths of `--data_root`, `--log_dir`, `--checkpoint_path` in the `test_*.sh` script first. When evaluating inference speed, please use a batch size of 1 and a single GPU.
-+ For **ScanRefer** evaluation
-  ```
-  sh scripts/test_scanrefer_single.sh
-  ```
-+ For **ScanRefer** evaluation
-  ```
-  sh scripts/test_scanrefer_single.sh
-  ```
-+ For **SR3D** evaluation
-  ```
-  sh scripts/test_sr3d.sh
-  ```
-+ For **NR3D** evaluation
-  ```
-  sh scripts/test_nr3d.sh
-  ```
-
-## Main Results
-+ We provide the checkpoints for quick reproduction of the results reported in the paper.
-  Benchmark | Pipeline | Acc@0.25 | Acc@0.5 | Inference Speed (FPS) | Downloads |
-  :----: | :----: | :----: | :----: | :----: | :----: |
-  ScanRefer | Single-stage | 56.45 | 46.71 | 12.43 | [model](https://huggingface.co/gwx22/TSP3D/blob/main/ckpt_scanrefer.pth)
-
-  Benchmark | Pipeline | Acc@0.25 | Acc@0.5 | Downloads |
-  :----: | :----: | :----: | :----: | :----: |
-  Nr3d | Single-stage | 48.7 | 37.0 | [model](https://huggingface.co/gwx22/TSP3D/blob/main/ckpt_nr3d.pth)
-  Sr3d | Single-stage | 57.1 | 44.1 | [model](https://huggingface.co/gwx22/TSP3D/blob/main/ckpt_sr3d.pth)
-
-+ Comparison of 3DVG methods on ScanRefer dataset:
-<figure>
-<p align="left" >
-<img src='figs/intro.jpg' width=400 alt="Figure 2"/>
-</p>
-</figure>
-
-## Visualization
-+ Visualization of the text-guided pruning process:
-
-<figure>
-<p align="center" >
-<img src='figs/prune.png' width=700 alt="Figure 3"/>
-</p>
-</figure>
-
-+ Visualization of the completion-based addition process:
-
-<figure>
-<p align="center" >
-<img src='figs/com.png' width=700 alt="Figure 4"/>
-</p>
-</figure>
-
-## Acknowledgements
-
-We are quite grateful for [DSPDet3D](https://github.com/xuxw98/DSPDet3D), [BUTD-DETR](https://github.com/nickgkan/butd_detr), [EDA](https://github.com/yanmin-wu/EDA), [ScanRefer](https://github.com/daveredrum/ScanRefer) and [TR3D](https://github.com/SamsungLabs/tr3d).
-
-
-## Citation
-```
-@article{guo2025tsp3d, 
-      title={Text-guided Sparse Voxel Pruning for Efficient 3D Visual Grounding}, 
-      author={Wenxuan Guo and Xiuwei Xu and Ziwei Wang and Jianjiang Feng and Jie Zhou and Jiwen Lu},
-      journal={arXiv preprint arXiv:2502.10392},
-      year={2025}
-}
-```
+아직 진행되지 않은 것 (수동 진행 예정):
+- [ ] 플래그 전부 off일 때 실제 학습 스텝에서 baseline과 loss 수치 동일 확인
+- [ ] `--use_ras`, `--use_spota`, full 학습 및 ScanRefer val Acc@0.25/0.5 평가
+- [ ] unique/multiple subset 분리 결과
+- [ ] oracle score(`--oracle_score`) case study — 아직 구현 안 됨 (지시서 작업 E, 우선순위 낮음)
