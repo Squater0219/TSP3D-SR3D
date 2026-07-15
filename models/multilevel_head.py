@@ -100,6 +100,7 @@ class TSPHead(nn.Module):
                  bbox_loss_weight = 1.0,
                  use_spota=False, use_ras=False,
                  spota_k=6, spota_mu=1.0, spota_alpha=0.0,
+                 spota_greedy_topk=False,
                  ras_beta=1.0, ras_tau=0.1):
         super(TSPHead, self).__init__()
         self.voxel_size = voxel_size
@@ -116,6 +117,7 @@ class TSPHead(nn.Module):
         self.spota_k = spota_k
         self.spota_mu = spota_mu
         self.spota_alpha = spota_alpha
+        self.spota_greedy_topk = spota_greedy_topk
         self.ras_beta = ras_beta
         self.ras_tau = ras_tau
         self.assigner = TR3DAssigner(top_pts_threshold=32, label2level=[0])
@@ -692,7 +694,8 @@ class TSPHead(nn.Module):
                 points, gt_bboxes, gt_labels, img_meta,
                 bbox_preds=pred_boxes, use_spota=True,
                 k=self.spota_k, mu=self.spota_mu, alpha=self.spota_alpha,
-                cls_preds=torch.cat(cls_preds).detach())
+                cls_preds=torch.cat(cls_preds).detach(),
+                spota_greedy_topk=self.spota_greedy_topk)
         else:
             assigned_ids = self.assigner.assign(points, gt_bboxes, gt_labels, img_meta)
 
@@ -792,6 +795,7 @@ class TSPHead(nn.Module):
     def _loss(self, bbox_preds, cls_preds, points, gt_bboxes, gt_labels, img_metas,
               keep_preds, keep_gts, bboxes_level, com_pred_training, com_coords_training):
         bbox_losses, cls_losses, pos_masks, com_losses, pos_masks_com = [], [], [], [], []
+        gt_counts = []
 
         #Step 26: Keep Loss 계산 — 레벨2·1의 voxel 보존 예측(keep_pred)과 GT 마스크(keep_gt) 간 FocalLoss
         # keep_preds: list[2] of list[B](N_i,1), keep_gts: list[2] of list[B](N_i,) bool → keep_losses: scalar
@@ -834,15 +838,27 @@ class TSPHead(nn.Module):
             com_losses.append(com_loss)
             pos_masks.append(pos_mask)
             pos_masks_com.append(pos_mask_com)
+            gt_counts.append(pos_mask.new_tensor(len(gt_labels[i]), dtype=torch.float32))
+
+        main_pos_count = torch.sum(torch.stack([x.sum() for x in pos_masks])).float()
+        main_point_count = torch.sum(torch.stack([x.new_tensor(x.numel()) for x in pos_masks])).float()
+        main_gt_count = torch.sum(torch.stack(gt_counts)).clamp(min=1.0)
+        com_pos_count = torch.sum(torch.stack([x.sum() for x in pos_masks_com])).float()
+        com_point_count = torch.sum(torch.stack([x.new_tensor(x.numel()) for x in pos_masks_com])).float()
 
         #Step 28: 손실 집계 및 딕셔너리 반환 — 4개 손실을 배치 평균하여 반환
         # bbox_losses, cls_losses, keep_losses, com_losses → dict{bbox_loss, cls_loss, keep_loss, com_loss}
         # bdetr.py에서 총합 loss = bbox_loss + cls_loss + keep_loss + com_loss 계산. 각 손실에 weight 적용.
         return dict(
             bbox_loss=self.bbox_loss_weight * torch.mean(torch.cat(bbox_losses)),
-            cls_loss=torch.sum(torch.cat(cls_losses)) / torch.sum(torch.cat(pos_masks)),
+            cls_loss=torch.sum(torch.cat(cls_losses)) / main_pos_count,
             keep_loss=self.keep_loss_weight * keep_losses / len(img_metas),
-            com_loss=torch.sum(torch.cat(com_losses)) / torch.sum(torch.cat(pos_masks_com))) 
+            com_loss=torch.sum(torch.cat(com_losses)) / com_pos_count,
+            main_pos_count=main_pos_count,
+            main_pos_per_gt=main_pos_count / main_gt_count,
+            main_pos_ratio=main_pos_count / main_point_count.clamp(min=1.0),
+            com_pos_count=com_pos_count,
+            com_pos_ratio=com_pos_count / com_point_count.clamp(min=1.0))
 
 
     def forward_train(self, x, text_feats, text_attention_mask, gt_bboxes, gt_labels, gt_all_bbox_new, auxi_bbox, img_metas,pc=None):
@@ -1086,7 +1102,7 @@ class TSPHead(nn.Module):
         head_time = time.time() - start_time
         return results, head_time
 
-def _spota_cost(points, boxes, bbox_preds, mu, alpha, cls_preds=None):
+def _spota_cost(points, boxes, bbox_preds, mu, alpha, cls_preds=None, return_iou=False):
     """SPOTA(Spatial-Prioritized OTA) cost. SR3D 본문 Eq.3-5.
     points: (n_points, n_boxes, 3) 브로드캐스트된 voxel 좌표 (사용 안 함, box와 pred만 필요)
     boxes:  (n_points, n_boxes, 7) 브로드캐스트된 GT 박스 (마지막 열은 yaw/pad, axis-aligned에선 무시)
@@ -1118,9 +1134,9 @@ def _spota_cost(points, boxes, bbox_preds, mu, alpha, cls_preds=None):
     rho = torch.norm(enclose_max - enclose_min, dim=-1)
     r_vd = vd / (2 * rho + 1e-6)
 
-    # gamma_c: center prior (예측 박스 중심 vs GT 중심)
+    # gamma_c: center prior (anchor/voxel center vs GT 중심)
     center_dist_sq = torch.sum(
-        torch.pow(pred_boxes[..., :3] - gt_boxes6[..., :3], 2), dim=-1)
+        torch.pow(points - gt_boxes6[..., :3], 2), dim=-1)
     gamma_c = 1 - torch.exp(-mu * center_dist_sq)
 
     cost = gamma_c * (c_reg + r_vd)
@@ -1129,6 +1145,13 @@ def _spota_cost(points, boxes, bbox_preds, mu, alpha, cls_preds=None):
         # 선택 ablation(기본 off): overlapping distractor 대응용 grounding term.
         grounding_term = alpha * (-F.logsigmoid(cls_preds).squeeze(-1))
         cost = cost + grounding_term.unsqueeze(1)
+
+    if return_iou:
+        pred_once = pred_lf[:, 0, :]
+        gt_once = gt_lf[0]
+        pairwise_iou = axis_aligned_bbox_overlaps_3d(
+            pred_once, gt_once, mode='iou', is_aligned=False)
+        return cost, pairwise_iou
 
     return cost
 
@@ -1146,7 +1169,7 @@ class TR3DAssigner:
     @torch.no_grad()
     def assign(self, points, gt_bboxes, gt_labels, img_meta,
                bbox_preds=None, use_spota=False, k=6, mu=1.0, alpha=0.0,
-               cls_preds=None):
+               cls_preds=None, spota_greedy_topk=False):
         # -> object id or -1 for each point
         # bbox_preds/use_spota 등은 SPOTA(메인 voxel 배정) 전용. 기본값(use_spota=False)에서는
         # 기존 center-distance 동작과 100% 동일 — completion 배정은 항상 이 기본 경로를 탄다.
@@ -1172,27 +1195,58 @@ class TR3DAssigner:
 
         # primary: box를 고르는 기준값(작을수록 좋음). off=center-distance, SPOTA on=cost.
         if use_spota and bbox_preds is not None:
-            primary_raw = _spota_cost(points, boxes, bbox_preds, mu, alpha, cls_preds)
+            primary_raw, pairwise_iou = _spota_cost(
+                points, boxes, bbox_preds, mu, alpha, cls_preds, return_iou=True)
             top_k = k
         else:
             center = boxes[..., :3]
             primary_raw = torch.sum(torch.pow(center - points, 2), dim=-1)
+            pairwise_iou = None
             top_k = self.top_pts_threshold
 
-        # condition 2: keep topk location per box by primary (level 조건 적용)
+        # condition 2: keep locations per box by primary (level 조건 적용)
         primary = torch.where(level_condition, primary_raw, float_max)
-        topk_vals = torch.topk(primary,
-                               min(top_k + 1, len(primary)),
-                               largest=False, dim=0).values[-1]
-        topk_condition = primary < topk_vals.unsqueeze(0)
+        if use_spota and bbox_preds is not None:
+            if spota_greedy_topk:
+                # Ablation: keep SPOTA cost, but choose a fixed least-cost top-k
+                # set per GT instead of simOTA dynamic-k.
+                topk_vals = torch.topk(primary,
+                                       min(top_k + 1, len(primary)),
+                                       largest=False, dim=0).values[-1]
+                topk_condition = primary < topk_vals.unsqueeze(0)
+            else:
+                # simOTA-style dynamic top-k: use the sum of top-k IoUs to decide
+                # how many least-cost anchors/voxels each GT receives.
+                iou_for_k = torch.where(level_condition, pairwise_iou, torch.zeros_like(pairwise_iou))
+                n_candidate_k = min(top_k, len(primary))
+                topk_ious = torch.topk(iou_for_k, n_candidate_k, dim=0).values
+                dynamic_ks = torch.clamp(topk_ious.sum(dim=0).int(), min=1)
+                topk_condition = torch.zeros_like(primary, dtype=torch.bool)
+                for gt_idx in range(n_boxes):
+                    valid = primary[:, gt_idx] < float_max
+                    if not valid.any():
+                        continue
+                    num_pos = min(int(dynamic_ks[gt_idx].item()), int(valid.sum().item()))
+                    valid_idx = valid.nonzero(as_tuple=False).squeeze(1)
+                    _, local_pos_idx = torch.topk(
+                        primary[valid_idx, gt_idx], num_pos, largest=False)
+                    topk_condition[valid_idx[local_pos_idx], gt_idx] = True
+        else:
+            topk_vals = torch.topk(primary,
+                                   min(top_k + 1, len(primary)),
+                                   largest=False, dim=0).values[-1]
+            topk_condition = primary < topk_vals.unsqueeze(0)
 
-        # condition 3.0: only closest object to point (level 조건 무시, raw 기준 — 기존과 동일)
-        _, min_inds_ = primary_raw.min(dim=1)
-
-        # condition 3: min primary to box per point, among topk-selected
+        # condition 3: resolve duplicate assignments per point/voxel.
         primary_topk = torch.where(topk_condition, primary_raw, float_max)
         min_values, min_ids = primary_topk.min(dim=1)
         min_inds = torch.where(min_values < float_max, min_ids, -1)
-        min_inds = torch.where(min_inds == min_inds_, min_ids, -1)
+
+        if not (use_spota and bbox_preds is not None):
+            # Baseline TR3D consistency filter: keep a top-k point only when its
+            # top-k GT also matches the global nearest-center GT. For SPOTA this
+            # would discard dynamic cost matches and shrink positives too much.
+            _, min_inds_ = primary_raw.min(dim=1)
+            min_inds = torch.where(min_inds == min_inds_, min_ids, -1)
 
         return min_inds

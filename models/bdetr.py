@@ -26,6 +26,7 @@ class BeaUTyDETR(nn.Module):
                  self_attend=True, voxel_size=0.01,
                  use_spota=False, use_ras=False,
                  spota_k=6, spota_mu=1.0, spota_alpha=0.0,
+                 spota_greedy_topk=False,
                  ras_beta=1.0, ras_tau=0.1):
         """Initialize layers."""
         super().__init__()
@@ -58,6 +59,7 @@ class BeaUTyDETR(nn.Module):
             voxel_size=self.voxel_size,
             use_spota=use_spota, use_ras=use_ras,
             spota_k=spota_k, spota_mu=spota_mu, spota_alpha=spota_alpha,
+            spota_greedy_topk=spota_greedy_topk,
             ras_beta=ras_beta, ras_tau=ras_tau)
         
     

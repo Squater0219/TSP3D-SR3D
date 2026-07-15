@@ -113,6 +113,7 @@ class TrainTester(BaseTrainTester):
             voxel_size = args.voxel_size,
             use_spota=args.use_spota, use_ras=args.use_ras,
             spota_k=args.spota_k, spota_mu=args.spota_mu, spota_alpha=args.spota_alpha,
+            spota_greedy_topk=args.spota_greedy_topk,
             ras_beta=args.ras_beta, ras_tau=args.ras_tau
         )
         return model

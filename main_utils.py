@@ -92,6 +92,8 @@ def parse_option():
                         help='for step scheduler. decay rate for lr')
     parser.add_argument('--clip_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
+    parser.add_argument('--grad_accum_steps', default=1, type=int,
+                        help='gradient accumulation steps; 1 keeps original per-batch update')
     parser.add_argument('--bn_momentum', type=float, default=0.1)
     parser.add_argument('--syncbn', action='store_true')
     parser.add_argument('--warmup-epoch', type=int, default=-1)
@@ -132,6 +134,8 @@ def parse_option():
     parser.add_argument('--spota_k', type=int, default=6)
     parser.add_argument('--spota_mu', type=float, default=1.0)
     parser.add_argument('--spota_alpha', type=float, default=0.0)
+    parser.add_argument('--spota_greedy_topk', action='store_true',
+                        help='SPOTA에서 simOTA dynamic-k 대신 cost 기반 fixed top-k assignment 사용')
     parser.add_argument('--ras_beta', type=float, default=1.0)
     parser.add_argument('--ras_tau', type=float, default=0.1)
 
@@ -378,7 +382,9 @@ class BaseTrainTester:
 
         # Get scheduler
         if not args.eval:
-            scheduler = get_scheduler(optimizer, len(train_loader), args)
+            grad_accum_steps = max(1, int(getattr(args, 'grad_accum_steps', 1)))
+            n_update_per_epoch = (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps
+            scheduler = get_scheduler(optimizer, n_update_per_epoch, args)
         else:
             scheduler = None
         
@@ -535,7 +541,8 @@ class BaseTrainTester:
     @staticmethod
     def _accumulate_stats(stat_dict, end_points):
         for key in end_points:
-            if 'loss' in key or 'acc' in key or 'ratio' in key:
+            if ('loss' in key or 'acc' in key or 'ratio' in key or
+                    'count' in key or 'per_gt' in key):
                 if key not in stat_dict:
                     stat_dict[key] = 0
                 if isinstance(end_points[key], (float, int)):
@@ -558,6 +565,7 @@ class BaseTrainTester:
         """
         stat_dict = {}  # collect statistics
         model.train()  # set model to training mode
+        grad_accum_steps = max(1, int(getattr(args, 'grad_accum_steps', 1)))
 
         # Loop over batches
         train_loader = tqdm(train_loader)
@@ -583,34 +591,49 @@ class BaseTrainTester:
             losses = model(inputs, gt_bboxes_3d, gt_labels_3d, gt_all_bbox_new, auxi_bbox, img_metas, epoch)
             loss = losses['loss']
 
-            #Step 26: Gradient 초기화 — 직전 배치의 누적 그라디언트를 0으로 리셋
-            # 누적된 .grad → zero
-            # backward() 전 필수 호출. 생략 시 배치 간 그라디언트가 합산되어 잘못된 업데이트 발생.
-            optimizer.zero_grad()
+            if grad_accum_steps == 1:
+                #Step 26: Gradient 초기화 — 직전 배치의 누적 그라디언트를 0으로 리셋
+                # 누적된 .grad → zero
+                # backward() 전 필수 호출. 생략 시 배치 간 그라디언트가 합산되어 잘못된 업데이트 발생.
+                optimizer.zero_grad()
+                loss_for_backward = loss
+                do_optimizer_step = True
+            else:
+                if batch_idx % grad_accum_steps == 0:
+                    optimizer.zero_grad()
+                group_start = (batch_idx // grad_accum_steps) * grad_accum_steps
+                group_end = min(group_start + grad_accum_steps, len(train_loader))
+                cur_accum_steps = group_end - group_start
+                loss_for_backward = loss / cur_accum_steps
+                do_optimizer_step = (
+                    ((batch_idx + 1) % grad_accum_steps == 0) or
+                    ((batch_idx + 1) == len(train_loader))
+                )
 
             #Step 27: 역전파 — 스칼라 손실에서 모든 학습 파라미터의 그라디언트 계산
             # loss(scalar) → 각 파라미터의 .grad 채워짐
             # AdamW 4개 그룹(base/trans/text/select) 전체에 chain rule 적용.
-            loss.backward()
+            loss_for_backward.backward()
 
-            if args.clip_norm > 0:
-                #Step 28: Gradient 클리핑 — 전체 파라미터 그라디언트 L2 norm을 clip_norm(=0.1)으로 제한
-                # grad_norm(클리핑 전) → grad_norm(≤0.1)
-                # 학습 초기 exploding gradient를 방지하여 안정적 수렴 보장.
-                grad_total_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), args.clip_norm
-                )
-                stat_dict['grad_norm'] = grad_total_norm
+            if do_optimizer_step:
+                if args.clip_norm > 0:
+                    #Step 28: Gradient 클리핑 — 전체 파라미터 그라디언트 L2 norm을 clip_norm(=0.1)으로 제한
+                    # grad_norm(클리핑 전) → grad_norm(≤0.1)
+                    # 학습 초기 exploding gradient를 방지하여 안정적 수렴 보장.
+                    grad_total_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.clip_norm
+                    )
+                    stat_dict['grad_norm'] = grad_total_norm
 
-            #Step 29: 파라미터 업데이트 — AdamW로 1차·2차 모멘트를 이용해 파라미터 갱신
-            # θ_t → θ_{t+1} (Adam 모멘트 추정 + decoupled weight decay)
-            # 그룹별 lr 차등 적용: base=5e-4, trans=5e-4, text=1e-5, select=4e-4.
-            optimizer.step()
+                #Step 29: 파라미터 업데이트 — AdamW로 1차·2차 모멘트를 이용해 파라미터 갱신
+                # θ_t → θ_{t+1} (Adam 모멘트 추정 + decoupled weight decay)
+                # 그룹별 lr 차등 적용: base=5e-4, trans=5e-4, text=1e-5, select=4e-4.
+                optimizer.step()
 
-            #Step 30: LR 스케줄러 업데이트 — 배치 단위로 warmup 또는 step decay 적용
-            # lr_t → lr_{t+1}
-            # lr_decay_epochs 이전: 선형 warmup. 이후: epoch 경계에서 ×lr_decay_rate(=0.1) 감소.
-            scheduler.step()
+                #Step 30: LR 스케줄러 업데이트 — 배치 단위로 warmup 또는 step decay 적용
+                # lr_t → lr_{t+1}
+                # lr_decay_epochs 이전: 선형 warmup. 이후: epoch 경계에서 ×lr_decay_rate(=0.1) 감소.
+                scheduler.step()
 
             # Accumulate statistics and print out
             stat_dict = self._accumulate_stats(stat_dict, losses)
@@ -631,7 +654,9 @@ class BaseTrainTester:
                 # wandb: per-step log
                 if dist.get_rank() == 0 and self.wandb_run is not None:
                     wlog = {f'train/{k}': stat_dict[k] / n
-                            for k in sorted(stat_dict.keys()) if 'loss' in k}
+                            for k in sorted(stat_dict.keys())
+                            if ('loss' in k or 'acc' in k or 'ratio' in k or
+                                'count' in k or 'per_gt' in k)}
                     if 'grad_norm' in stat_dict:
                         gn = stat_dict['grad_norm']
                         wlog['train/grad_norm'] = gn.item() if hasattr(gn, 'item') else float(gn)
