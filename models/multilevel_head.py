@@ -22,7 +22,7 @@ def soft_rank(scores, tau=0.1, eps=1e-6):
     내림차순 soft rank. SR3D 보충자료 Eq.9-10.
     scores: 1D tensor (점수가 클수록 '좋음', rank가 높음)
     반환 r: 1D tensor, r in (0,1], 점수가 클수록 r이 1에 가까움.
-      R_i = (1/(N-1)) * sum_{j != i} sigmoid((s_j - s_i)/tau)   # 나보다 큰 점수의 비율
+      R_i = (1/N) * sum_{j != i} sigmoid((s_j - s_i)/tau)   # SR3D Eq.9
       r_i = exp(-R_i)
     tau -> 0 이면 hard rank에 수렴. 작은 점수일수록 R_i가 커져 r_i가 작아진다.
     """
@@ -34,8 +34,8 @@ def soft_rank(scores, tau=0.1, eps=1e-6):
         return torch.ones_like(s)
     diff = s.unsqueeze(0) - s.unsqueeze(1)          # diff[i, j] = s_j - s_i
     mask = ~torch.eye(N, dtype=torch.bool, device=s.device)
-    # i(행) 고정, j(열)에 대해 합산 -> R_i = sum_j sigmoid((s_j - s_i)/tau) / (N-1)
-    R = (torch.sigmoid(diff / tau) * mask).sum(dim=1) / (N - 1)
+    # i(행) 고정, j(열)에 대해 합산 -> SR3D Eq.9의 1/N 정규화.
+    R = (torch.sigmoid(diff / tau) * mask).sum(dim=1) / N
     r = torch.exp(-R)
     return r
 
@@ -771,13 +771,25 @@ class TSPHead(nn.Module):
         q = axis_aligned_bbox_overlaps_3d(
             self._bbox_to_loss(pos_pred_boxes), self._bbox_to_loss(pos_gt_boxes),
             mode='iou', is_aligned=True
-        ).clamp(min=1e-6, max=1 - 1e-6)
+        ).clamp(min=1e-6, max=1 - 1e-6).detach()
 
         # sig_i = 분류 confidence
         sig = cls_preds[pos_mask].sigmoid().squeeze(-1).clamp(min=1e-6, max=1 - 1e-6)
 
-        r_reg = soft_rank(q, tau=self.ras_tau)     # IoU 순위 (잘 맞출수록 1에 가까움)
-        r_cls = soft_rank(sig, tau=self.ras_tau)   # confidence 순위
+        # SR3D의 rank는 장면 전체가 아니라 각 GT에 배정된 positive 집합 내에서 계산한다.
+        # ScanRefer target은 보통 GT 1개지만, joint_det의 ScanNet 샘플은 multi-GT이므로
+        # assigned_ids로 group하지 않으면 서로 다른 객체의 IoU/confidence가 한 rank에서 경쟁한다.
+        pos_assigned_ids = assigned_ids[pos_mask]
+        r_reg = torch.zeros_like(q)
+        r_cls = torch.zeros_like(sig)
+        for gt_id in torch.unique(pos_assigned_ids):
+            group_idx = torch.nonzero(
+                pos_assigned_ids == gt_id, as_tuple=False).squeeze(1)
+            r_reg = r_reg.index_copy(
+                0, group_idx, soft_rank(q[group_idx], tau=self.ras_tau))
+            r_cls = r_cls.index_copy(
+                0, group_idx, soft_rank(sig[group_idx], tau=self.ras_tau))
+        r_reg = r_reg.detach()  # IoU teacher rank
 
         # RDL: self-distillation 손실 (SR3D Eq.6), 부호는 cross-entropy 관례에 맞춰 -RDL을 손실로 사용.
         rdl = (1 - r_reg).pow(self.ras_beta) * (q * torch.log(sig)) \

@@ -100,17 +100,17 @@ def soft_rank(scores, tau=0.1, eps=1e-6):
     N = s.numel()
     if N == 1:
         return torch.ones_like(s)
-    diff = s.unsqueeze(0) - s.unsqueeze(1)          # diff[j, i] = s_j - s_i
-    R = torch.sigmoid(diff / tau).sum(dim=0)        # sum over j
-    R = (R - torch.sigmoid(torch.zeros(1, device=s.device))) / max(N - 1, 1)  # j != i 보정
+    diff = s.unsqueeze(0) - s.unsqueeze(1)          # diff[i, j] = s_j - s_i
+    mask = ~torch.eye(N, dtype=torch.bool, device=s.device)
+    R = (torch.sigmoid(diff / tau) * mask).sum(dim=1) / N
     r = torch.exp(-R)
     return r
 ```
 
-주의: `j != i` 항만 합산해야 하므로 대각 성분(`sigmoid(0)=0.5`)을 빼고 `N-1`로 정규화한다. 위 구현은 그 보정을 포함한다. 구현이 헷갈리면 명시적으로 대각 마스크를 써도 된다:
+주의: `j != i` 항만 합산해야 하므로 대각 성분(`sigmoid(0)=0.5`)을 마스크로 제외하고, SR3D Eq.9에 따라 `N`으로 정규화한다:
 ```python
 mask = ~torch.eye(N, dtype=torch.bool, device=s.device)
-R = (torch.sigmoid(diff / tau) * mask).sum(dim=0) / (N - 1)
+R = (torch.sigmoid(diff / tau) * mask).sum(dim=1) / N
 ```
 
 ---
@@ -311,7 +311,7 @@ SR3D는 "박스는 잘 그리는데 confidence를 못 매긴다"를 증명하려
 
 **soft rank (내림차순, SR3D Eq.9-10)**
 ```
-R_i = (1/(N-1)) * sum_{j != i} sigmoid((s_j - s_i)/tau)
+R_i = (1/N) * sum_{j != i} sigmoid((s_j - s_i)/tau)
 r_i = exp(-R_i)
 ```
 
